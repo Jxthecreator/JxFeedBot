@@ -1,0 +1,1 @@
+worker: python multi_price_feeds.py
