@@ -1,0 +1,3 @@
+# prevent secrets and cache files from uploading
+.env
+__pycache__/.venv/
