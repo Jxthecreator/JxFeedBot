@@ -1,13 +1,13 @@
 # ============================================================
 #  JxFeedBot - Multi-Coin Telegram Price Poster (CoinGecko REST)
 #  Coins: BTC, ETH, BNB, SOL, XRP, XPR
-#  Render WebService keep-alive via Flask
+#  Render WebService keep-alive via Flask + robust TG logging
 # ============================================================
 
 import os, time, signal, sys, requests, threading
 from dotenv import load_dotenv
 
-# --- keep-alive server for Render ---
+# ---------- keep-alive server for Render ----------
 from flask import Flask
 app = Flask(__name__)
 
@@ -17,10 +17,9 @@ def home():
 
 def keep_alive():
     port = int(os.getenv("PORT", "10000"))
-    # do NOT use reloader or debug in production
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# start the web server in a background thread
+# Start the web server in a background thread
 threading.Thread(target=keep_alive, daemon=True).start()
 
 # ------------------- Load Environment -------------------
@@ -33,19 +32,28 @@ if not BOT_TOKEN:
 
 TG_SEND_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
+def env(name: str, default: str = "") -> str:
+    v = os.getenv(name, default)
+    return v.strip() if v else v
+
 CHANNELS = {
-    "BTC": os.getenv("CHAT_BTC", "@BTCLiveFeed").strip(),
-    "ETH": os.getenv("CHAT_ETH", "@ETHLiveFeed").strip(),
-    "BNB": os.getenv("CHAT_BNB", "@BNBLiveFeed").strip(),
-    "SOL": os.getenv("CHAT_SOL", "@SOLLiveFeed").strip(),
-    "XRP": os.getenv("CHAT_XRP", "@XRPLiveFeed").strip(),
-    "XPR": os.getenv("CHAT_XPR", "@XPRLiveFeed").strip(),
+    "BTC": env("CHAT_BTC", "@BTCLiveFeed"),
+    "ETH": env("CHAT_ETH", "@ETHLiveFeed"),
+    "BNB": env("CHAT_BNB", "@BNBLiveFeed"),
+    "SOL": env("CHAT_SOL", "@SOLLiveFeed"),
+    "XRP": env("CHAT_XRP", "@XRPLiveFeed"),
+    "XPR": env("CHAT_XPR", "@XPRLiveFeed"),
 }
 
-POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "60"))
-PRICE_DECIMALS = int(os.getenv("PRICE_DECIMALS", "2"))
-MIN_ABS_MOVE   = float(os.getenv("MIN_ABS_MOVE", "0"))
-LOG_ERRORS     = os.getenv("LOG_ERRORS", "true").lower() == "true"
+POLL_SECONDS   = int(env("POLL_SECONDS", "60"))
+PRICE_DECIMALS = int(env("PRICE_DECIMALS", "2"))
+MIN_ABS_MOVE   = float(env("MIN_ABS_MOVE", "0"))
+LOG_ERRORS     = env("LOG_ERRORS", "true").lower() == "true"
+
+# Debug: show what env keys we actually see
+seen_keys = [k for k in os.environ.keys() if k.startswith("CHAT_") or "TELEGRAM" in k]
+print("[ENV DEBUG] Seen keys:", seen_keys)
+print("[ENV DEBUG] Channel map:", {k: CHANNELS[k] for k in CHANNELS})
 
 # ------------------- CoinGecko -------------------
 CG_IDS = {
@@ -59,11 +67,14 @@ CG_IDS = {
 CG_URL = "https://api.coingecko.com/api/v3/simple/price"
 CG_PARAMS = {"ids": ",".join(CG_IDS.values()), "vs_currencies": "usd"}
 CG_TIMEOUT = 15
-
 http = requests.Session()
+http.headers.update({"User-Agent": "JxFeedBot/1.0"})
+
+# ------------------- State -------------------
 last_price = {s: None for s in CHANNELS}
 _stop = False
 
+# ------------------- Helpers -------------------
 def fmt_usd(v: float) -> str:
     return f"$ {v:,.{PRICE_DECIMALS}f}"
 
@@ -77,16 +88,35 @@ def should_post(sym: str, new_price: float) -> bool:
         return True
     return False
 
+def tg_post(chat_id: str, text: str) -> requests.Response:
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    r = http.post(TG_SEND_URL, json=payload, timeout=12)
+    if r.status_code != 200:
+        # Print exact error body so we know 403 vs 400 etc.
+        print(f"[TG ERROR] status={r.status_code} chat={chat_id} body={r.text}")
+    r.raise_for_status()
+    return r
+
 def post_price(sym: str, price: float):
-    payload = {"chat_id": CHANNELS[sym], "text": fmt_usd(price), "disable_web_page_preview": True}
+    chat = CHANNELS[sym]
     try:
-        r = http.post(TG_SEND_URL, json=payload, timeout=12)
-        r.raise_for_status()
+        tg_post(chat, fmt_usd(price))
         last_price[sym] = price
-        print(f"[OK] {sym}: {fmt_usd(price)}")
+        print(f"[OK] {sym} → {chat}: {fmt_usd(price)}")
     except Exception as e:
         if LOG_ERRORS:
-            print(f"[ERROR] Telegram post failed for {sym}: {e}")
+            print(f"[ERROR] Telegram post failed for {sym} → {chat}: {e}")
+
+def startup_ping():
+    """Try a 'live' message to each configured channel to surface TG errors immediately."""
+    for sym, chat in CHANNELS.items():
+        if not chat:
+            continue
+        try:
+            tg_post(chat, f"🟢 JxFeedBot live for {sym}")
+            print(f"[LIVE] Pinged {sym} → {chat}")
+        except Exception as e:
+            print(f"[LIVE ERROR] {sym} → {chat}: {e}")
 
 def fetch_prices() -> dict:
     r = http.get(CG_URL, params=CG_PARAMS, timeout=CG_TIMEOUT)
@@ -106,12 +136,16 @@ def loop():
         try:
             prices = fetch_prices()
             for sym, price in prices.items():
-                if sym not in CHANNELS or not CHANNELS[sym]:
+                chat = CHANNELS.get(sym)
+                if not chat:
+                    continue
+                # Force an initial post so wiring is obvious
+                if last_price[sym] is None:
+                    print(f"[INIT] First post for {sym} at {fmt_usd(price)}")
+                    post_price(sym, price)
                     continue
                 if should_post(sym, price):
                     post_price(sym, price)
-                elif last_price[sym] is None:
-                    last_price[sym] = price
             time.sleep(POLL_SECONDS)
             backoff = POLL_SECONDS
         except requests.HTTPError as e:
@@ -130,15 +164,24 @@ def loop():
 def shutdown(*_):
     global _stop
     _stop = True
-    try: http.close()
+    try:
+        http.close()
     finally:
         print("Shutting down cleanly…")
         sys.exit(0)
 
+# ------------------- Main -------------------
 if __name__ == "__main__":
+    # Basic env validation
     for sym, chat in CHANNELS.items():
         if not chat:
             raise SystemExit(f"❌ Missing channel for {sym} (set CHAT_{sym})")
+
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+
+    # Send startup 'live' pings so you immediately see TG permission/ID errors
+    startup_ping()
+
+    # Start price loop
     loop()
