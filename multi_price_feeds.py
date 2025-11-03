@@ -4,11 +4,11 @@
 #  Render WebService keep-alive via Flask + robust TG logging
 # ============================================================
 
-import os, time, signal, sys, requests, threading
+import os, time, signal, sys, requests, threading, random
 from dotenv import load_dotenv
 
 # ---------- keep-alive server for Render ----------
-from flask import Flask
+from flask import Flask, jsonify
 app = Flask(__name__)
 
 @app.get("/")
@@ -45,7 +45,7 @@ CHANNELS = {
     "XPR": env("CHAT_XPR", "@XPRLiveFeed"),
 }
 
-POLL_SECONDS   = int(env("POLL_SECONDS", "60"))
+POLL_SECONDS   = int(env("POLL_SECONDS", "120"))   # slower default to avoid 429
 PRICE_DECIMALS = int(env("PRICE_DECIMALS", "2"))
 MIN_ABS_MOVE   = float(env("MIN_ABS_MOVE", "0"))
 LOG_ERRORS     = env("LOG_ERRORS", "true").lower() == "true"
@@ -65,10 +65,13 @@ CG_IDS = {
     "XPR": "proton",
 }
 CG_URL = "https://api.coingecko.com/api/v3/simple/price"
-CG_PARAMS = {"ids": ",".join(CG_IDS.values()), "vs_currencies": "usd"}
 CG_TIMEOUT = 15
 http = requests.Session()
 http.headers.update({"User-Agent": "JxFeedBot/1.0"})
+
+def cg_params():
+    # Build each time in case you later toggle coins via env
+    return {"ids": ",".join(CG_IDS.values()), "vs_currencies": "usd"}
 
 # ------------------- State -------------------
 last_price = {s: None for s in CHANNELS}
@@ -107,19 +110,8 @@ def post_price(sym: str, price: float):
         if LOG_ERRORS:
             print(f"[ERROR] Telegram post failed for {sym} → {chat}: {e}")
 
-def startup_ping():
-    """Try a 'live' message to each configured channel to surface TG errors immediately."""
-    for sym, chat in CHANNELS.items():
-        if not chat:
-            continue
-        try:
-            tg_post(chat, f"🟢 JxFeedBot live for {sym}")
-            print(f"[LIVE] Pinged {sym} → {chat}")
-        except Exception as e:
-            print(f"[LIVE ERROR] {sym} → {chat}: {e}")
-
 def fetch_prices() -> dict:
-    r = http.get(CG_URL, params=CG_PARAMS, timeout=CG_TIMEOUT)
+    r = http.get(CG_URL, params=cg_params(), timeout=CG_TIMEOUT)
     r.raise_for_status()
     data = r.json()
     out = {}
@@ -128,6 +120,36 @@ def fetch_prices() -> dict:
         if usd is not None:
             out[sym] = float(usd)
     return out
+
+# ---- Startup: fetch once and post actual prices (not just a ping)
+def startup_post_prices():
+    try:
+        prices = fetch_prices()
+        for sym, chat in CHANNELS.items():
+            if not chat:
+                continue
+            p = prices.get(sym)
+            if p is not None:
+                print(f"[INIT] Startup post for {sym} at {fmt_usd(p)}")
+                post_price(sym, p)
+            else:
+                # Fallback: still show "live" if price missing
+                tg_post(chat, f"🟢 JxFeedBot live for {sym}")
+                print(f"[LIVE] Pinged {sym} → {chat}")
+    except Exception as e:
+        print(f"[LIVE ERROR] startup price fetch failed: {e}")
+
+# ---- Force a manual post (for testing)
+@app.get("/post-now")
+def post_now():
+    try:
+        prices = fetch_prices()
+        for sym, price in prices.items():
+            if sym in CHANNELS and CHANNELS[sym]:
+                post_price(sym, price)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 def loop():
     backoff = POLL_SECONDS
@@ -139,27 +161,35 @@ def loop():
                 chat = CHANNELS.get(sym)
                 if not chat:
                     continue
-                # Force an initial post so wiring is obvious
+                # First time we see a price for this sym, we post it
                 if last_price[sym] is None:
                     print(f"[INIT] First post for {sym} at {fmt_usd(price)}")
                     post_price(sym, price)
                     continue
                 if should_post(sym, price):
                     post_price(sym, price)
+
+            # normal cadence
             time.sleep(POLL_SECONDS)
             backoff = POLL_SECONDS
+
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
             if status in (429, 500, 502, 503, 504):
-                backoff = min(max(int(backoff * 1.5), 30), 180)
+                # backoff with jitter to avoid CG buckets
+                base = max(backoff * 1.5, 60)
+                jitter = random.randint(0, 45)
+                backoff = int(min(base + jitter, 300))
                 print(f"[WARN] CoinGecko HTTP {status}. Backing off {backoff}s…")
                 time.sleep(backoff)
             else:
                 print("[HTTP ERROR]", e)
                 time.sleep(backoff)
+
         except Exception as e:
             print("[ERROR]", e)
-            time.sleep(backoff)
+            # small randomized sleep to avoid hot loops
+            time.sleep(min(backoff, 120))
 
 def shutdown(*_):
     global _stop
@@ -180,8 +210,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # Send startup 'live' pings so you immediately see TG permission/ID errors
-    startup_ping()
+    # Post prices immediately on boot
+    startup_post_prices()
 
     # Start price loop
     loop()
